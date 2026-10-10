@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Mobile: viewport-fit=cover exposes the safe-area insets (--safe-* in
+         index.css); resizes-content makes the soft keyboard shrink the layout
+         viewport so dvh-sized sheets stay above it. Pinch zoom is intentionally
+         kept (no maximum-scale). -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+    <!-- Browser / system bar colour: the Obli Operator page background (default theme). -->
+    <meta name="theme-color" content="#0b0d1a" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Rajdhani:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <title>Obliguard</title>
+    <!-- FOUC prevention: set the theme before React boots so a saved light theme
+         doesn't flash dark on reload. Mirrors client/src/utils/theme.ts (key: og-theme). -->
+    <script>
+      try {
+        var t = localStorage.getItem('og-theme');
+        if (t === 'obli-operator' || t === 'obli-daylight' || t === 'obli-dim' || t === 'modern' || t === 'neon') {
+          document.documentElement.dataset.theme = t;
+        } else {
+          document.documentElement.dataset.theme = 'obli-operator';
+        }
+      } catch (e) {
+        document.documentElement.dataset.theme = 'obli-operator';
+      }
+    </script>
+    <style>
+      [data-theme="obli-daylight"] body { background: #e5e9f0; }
+      [data-theme="obli-dim"] body { background: #2e3440; }
+    </style>
+  </head>
+  <body class="bg-bg-primary text-text-primary">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

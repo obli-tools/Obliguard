@@ -1,0 +1,357 @@
+import { db } from '../db';
+import type { MonitorGroup, GroupTreeNode, AgentThresholds, AgentGroupConfig } from '@obliview/shared';
+import { isMasterTenant } from '@obliview/shared';
+import { settingsService, legacyTypesToFlags, writableDefinition, normalizeSettingValue } from './settings.service';
+import { agentConfigService } from './agentConfig.service';
+
+/**
+ * agentGroupConfig keys that are IPS settings cascade keys: written as
+ * group settings rows, the column keeping a mirror for its legacy readers.
+ */
+const CASCADE_GROUP_KEYS: ReadonlyArray<{ legacy: 'pushIntervalSeconds' | 'maxMissedPushes' | 'notificationTypes'; key: string }> = [
+  { legacy: 'pushIntervalSeconds', key: 'checkIntervalSeconds' },
+  { legacy: 'maxMissedPushes', key: 'maxMissedPushes' },
+  { legacy: 'notificationTypes', key: 'notificationTypes' },
+];
+
+interface GroupRow {
+  id: number;
+  name: string;
+  slug: string;
+  description: string | null;
+  parent_id: number | null;
+  sort_order: number;
+  is_general: boolean;
+  evaluate_only?: boolean;
+  kind: string;
+  tenant_id: number;
+  agent_thresholds?: AgentThresholds | null;
+  agent_group_config?: AgentGroupConfig | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+function rowToGroup(row: GroupRow): MonitorGroup {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    description: row.description,
+    parentId: row.parent_id,
+    sortOrder: row.sort_order,
+    isGeneral: row.is_general,
+    evaluateOnly: row.evaluate_only ?? false,
+    kind: (row.kind as MonitorGroup['kind']) || 'monitor',
+    tenantId: row.tenant_id,
+    agentThresholds: row.agent_thresholds
+      ? (typeof row.agent_thresholds === 'string' ? JSON.parse(row.agent_thresholds) : row.agent_thresholds)
+      : null,
+    agentGroupConfig: row.agent_group_config
+      ? (typeof row.agent_group_config === 'string' ? JSON.parse(row.agent_group_config) : row.agent_group_config)
+      : null,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+async function ensureUniqueSlug(slug: string, excludeId?: number): Promise<string> {
+  let candidate = slug;
+  let i = 1;
+  while (true) {
+    const q = db('monitor_groups').where({ slug: candidate });
+    if (excludeId) q.whereNot({ id: excludeId });
+    const exists = await q.first();
+    if (!exists) return candidate;
+    candidate = `${slug}-${i++}`;
+  }
+}
+
+export const groupService = {
+  async getAll(tenantId: number): Promise<MonitorGroup[]> {
+    const q = db<GroupRow>('monitor_groups').orderBy('sort_order').orderBy('name');
+    if (!isMasterTenant(tenantId)) q.where({ tenant_id: tenantId });
+    const rows = await q;
+    return rows.map(rowToGroup);
+  },
+
+  async getById(id: number): Promise<MonitorGroup | null> {
+    const row = await db<GroupRow>('monitor_groups').where({ id }).first();
+    return row ? rowToGroup(row) : null;
+  },
+
+  /** Owning tenant of each existing group id (missing ids are absent from the map). */
+  async getTenantIds(ids: number[]): Promise<Map<number, number>> {
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return new Map();
+    const rows = await db('monitor_groups').whereIn('id', unique).select('id', 'tenant_id') as Array<{ id: number; tenant_id: number }>;
+    return new Map(rows.map((r) => [r.id, r.tenant_id]));
+  },
+
+  async create(data: {
+    name: string;
+    description?: string | null;
+    parentId?: number | null;
+    sortOrder?: number;
+    isGeneral?: boolean;
+    kind?: 'agent';
+  }, tenantId: number): Promise<MonitorGroup> {
+    const slug = await ensureUniqueSlug(slugify(data.name));
+
+    const [row] = await db<GroupRow>('monitor_groups')
+      .insert({
+        name: data.name,
+        slug,
+        description: data.description ?? null,
+        parent_id: data.parentId ?? null,
+        sort_order: data.sortOrder ?? 0,
+        is_general: data.isGeneral ?? false,
+        kind: 'agent',
+        tenant_id: tenantId,
+      })
+      .returning('*');
+
+    // Maintain closure table
+    // Self-reference (depth 0)
+    await db('group_closure').insert({
+      ancestor_id: row.id,
+      descendant_id: row.id,
+      depth: 0,
+    });
+
+    // Copy ancestor paths from parent
+    if (data.parentId) {
+      await db.raw(
+        `INSERT INTO group_closure (ancestor_id, descendant_id, depth)
+         SELECT gc.ancestor_id, ?, gc.depth + 1
+         FROM group_closure gc
+         WHERE gc.descendant_id = ?`,
+        [row.id, data.parentId],
+      );
+    }
+
+    // The settings resolver walks the closure: a new chain is visible at once.
+    agentConfigService.invalidate();
+    return rowToGroup(row);
+  },
+
+  async update(
+    id: number,
+    data: {
+      name?: string;
+      description?: string | null;
+      sortOrder?: number;
+      isGeneral?: boolean;
+      evaluateOnly?: boolean;
+    },
+  ): Promise<MonitorGroup | null> {
+    const updateData: Record<string, unknown> = { updated_at: new Date() };
+
+    if (data.name !== undefined) {
+      updateData.name = data.name;
+      updateData.slug = await ensureUniqueSlug(slugify(data.name), id);
+    }
+    if (data.description !== undefined) updateData.description = data.description;
+    if (data.sortOrder !== undefined) updateData.sort_order = data.sortOrder;
+    if (data.isGeneral !== undefined) updateData.is_general = data.isGeneral;
+    if (data.evaluateOnly !== undefined) updateData.evaluate_only = data.evaluateOnly;
+
+    const [row] = await db<GroupRow>('monitor_groups')
+      .where({ id })
+      .update(updateData)
+      .returning('*');
+
+    // Name (inheritance source label) or evaluate-only (cascade) changed.
+    if (data.name !== undefined || data.evaluateOnly !== undefined) {
+      agentConfigService.invalidate();
+      if (data.evaluateOnly !== undefined) {
+        const { invalidateEvaluateOnlyCache } = await import('./agent.service');
+        invalidateEvaluateOnlyCache();
+      }
+    }
+    return row ? rowToGroup(row) : null;
+  },
+
+  async move(id: number, newParentId: number | null): Promise<MonitorGroup | null> {
+    // Get current group
+    const group = await db<GroupRow>('monitor_groups').where({ id }).first();
+    if (!group) return null;
+
+    // Prevent circular reference: newParentId must not be a descendant of id
+    if (newParentId !== null) {
+      const isDescendant = await db('group_closure')
+        .where({ ancestor_id: id, descendant_id: newParentId })
+        .first();
+      if (isDescendant) {
+        throw new Error('Cannot move group into its own descendant');
+      }
+    }
+
+    // Get all descendants of the subtree (including self)
+    const subtreeIds = await db('group_closure')
+      .where({ ancestor_id: id })
+      .select('descendant_id');
+    const descIds = subtreeIds.map((r) => r.descendant_id);
+
+    // Remove all closure entries where ancestor is NOT in the subtree
+    // but descendant IS in the subtree (these are the "outside" links)
+    await db('group_closure')
+      .whereIn('descendant_id', descIds)
+      .whereNotIn('ancestor_id', descIds)
+      .del();
+
+    // Reconnect: for each ancestor of newParent, create links to every node in subtree
+    if (newParentId !== null) {
+      await db.raw(
+        `INSERT INTO group_closure (ancestor_id, descendant_id, depth)
+         SELECT p.ancestor_id, s.descendant_id, p.depth + s.depth + 1
+         FROM group_closure p
+         CROSS JOIN group_closure s
+         WHERE p.descendant_id = ?
+           AND s.ancestor_id = ?`,
+        [newParentId, id],
+      );
+    }
+
+    // Update the parent_id column
+    const [row] = await db<GroupRow>('monitor_groups')
+      .where({ id })
+      .update({ parent_id: newParentId, updated_at: new Date() })
+      .returning('*');
+
+    // New ancestors: the subtree now inherits another chain.
+    agentConfigService.invalidate();
+    return row ? rowToGroup(row) : null;
+  },
+
+  async delete(id: number): Promise<boolean> {
+    // The sub-groups go too (CASCADE): their settings rows have no FK.
+    const subtree = await db('group_closure').where({ ancestor_id: id }).pluck('descendant_id') as number[];
+    // CASCADE in the DB handles closure table and child groups
+    const count = await db('monitor_groups').where({ id }).del();
+    if (count > 0) await settingsService.removeScopes('group', [...new Set([id, ...subtree])]);
+    return count > 0;
+  },
+
+  // ── Tree queries using closure table ──
+
+  async getAncestors(groupId: number): Promise<MonitorGroup[]> {
+    const rows = await db<GroupRow>('monitor_groups')
+      .join('group_closure', 'monitor_groups.id', 'group_closure.ancestor_id')
+      .where('group_closure.descendant_id', groupId)
+      .where('group_closure.depth', '>', 0)
+      .orderBy('group_closure.depth', 'desc')
+      .select('monitor_groups.*');
+    return rows.map(rowToGroup);
+  },
+
+  async getDescendantIds(groupId: number): Promise<number[]> {
+    const rows = await db('group_closure')
+      .where({ ancestor_id: groupId })
+      .select('descendant_id');
+    return rows.map((r) => r.descendant_id);
+  },
+
+  async getChildren(parentId: number | null): Promise<MonitorGroup[]> {
+    const query = db<GroupRow>('monitor_groups').orderBy('sort_order').orderBy('name');
+    if (parentId === null) {
+      query.whereNull('parent_id');
+    } else {
+      query.where({ parent_id: parentId });
+    }
+    const rows = await query;
+    return rows.map(rowToGroup);
+  },
+
+  async getTree(tenantId: number): Promise<GroupTreeNode[]> {
+    const allGroups = await this.getAll(tenantId);
+    const groupMap = new Map<number, GroupTreeNode>();
+
+    // Initialize nodes
+    for (const g of allGroups) {
+      groupMap.set(g.id, { ...g, children: [] });
+    }
+
+    // Build tree
+    const roots: GroupTreeNode[] = [];
+    for (const node of groupMap.values()) {
+      if (node.parentId && groupMap.has(node.parentId)) {
+        groupMap.get(node.parentId)!.children.push(node);
+      } else {
+        roots.push(node);
+      }
+    }
+
+    return roots;
+  },
+
+  /** Batch-update sortOrder for multiple groups of one tenant at once */
+  async reorder(items: { id: number; sortOrder: number }[], tenantId: number): Promise<void> {
+    await db.transaction(async (trx) => {
+      for (const item of items) {
+        await trx('monitor_groups')
+          .where({ id: item.id, tenant_id: tenantId })
+          .update({ sort_order: item.sortOrder, updated_at: new Date() });
+      }
+    });
+  },
+
+  /** Update the default thresholds for an agent group */
+  async updateAgentThresholds(id: number, thresholds: AgentThresholds): Promise<MonitorGroup | null> {
+    const [row] = await (db<GroupRow>('monitor_groups')
+      .where({ id })
+      .update({ agent_thresholds: JSON.stringify(thresholds), updated_at: new Date() } as Record<string, unknown>)
+      .returning('*') as Promise<GroupRow[]>);
+    return row ? rowToGroup(row) : null;
+  },
+
+  /**
+   * Update the agent-group config (push interval, max missed pushes,
+   * notification types, update policy) — compat endpoint of the IPS settings
+   * cascade. The cascade keys are validated (AppError 400) and written
+   * as group settings rows; the column is still merged as before (mirror for
+   * its legacy readers, and the updatePolicy that stays there).
+   */
+  async updateAgentGroupConfig(id: number, config: Partial<AgentGroupConfig>): Promise<MonitorGroup | null> {
+    const group = await db('monitor_groups').where({ id }).first('tenant_id') as { tenant_id: number } | undefined;
+    if (!group) return null;
+    const writes: Array<{ key: string; value: unknown }> = [];
+    for (const { legacy, key } of CASCADE_GROUP_KEYS) {
+      if (!(legacy in config)) continue;
+      const raw = config[legacy];
+      writes.push({ key, value: legacy === 'notificationTypes' ? legacyTypesToFlags(raw ?? null) : (raw ?? null) });
+    }
+    for (const w of writes) {
+      if (w.value !== null) normalizeSettingValue(writableDefinition(w.key, 'group'), w.value);
+    }
+
+    // Merge with existing config
+    const existing = await db('monitor_groups').where({ id }).select('agent_group_config').first() as
+      { agent_group_config: AgentGroupConfig | null } | undefined;
+    const merged: AgentGroupConfig = {
+      pushIntervalSeconds: null,
+      maxMissedPushes: null,
+      notificationTypes: null,
+      ...(typeof existing?.agent_group_config === 'string'
+        ? JSON.parse(existing.agent_group_config)
+        : (existing?.agent_group_config ?? {})),
+      ...config,
+    };
+    // Obliview leftover stored by older versions: dropped on the next write.
+    delete (merged as unknown as Record<string, unknown>).heartbeatMonitoring;
+    const [row] = await (db<GroupRow>('monitor_groups')
+      .where({ id })
+      .update({ agent_group_config: JSON.stringify(merged), updated_at: new Date() } as Record<string, unknown>)
+      .returning('*') as Promise<GroupRow[]>);
+    if (writes.length > 0) {
+      await settingsService.writeMany({ level: 'group', scopeId: id, tenantId: group.tenant_id }, writes, { mirror: false });
+    }
+    return row ? rowToGroup(row) : null;
+  },
+};

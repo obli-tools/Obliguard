@@ -1,0 +1,209 @@
+node_modules/
+dist/
+!agent/dist/
+agent/dist/*.exe
+agent/bin/*.exe
+
+# Wizard embed artifacts — copied in transiently by the wizard build step, then deleted.
+# Listed so an interrupted build never commits the (large) embedded MSI/binary.
+agent/wizard/windows/obliguard-agent.msi
+agent/wizard/windows/rsrc_windows.syso
+agent/wizard/linux/obliguard-agent
+!desktop-app/dist/
+.env
+*.log
+.DS_Store
+Thumbs.db
+coverage/
+.vscode/
+.idea/
+*.tsbuildinfo
+
+# Caches Python (outillage fixtures)
+__pycache__/
+*.pyc
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Hors build : JAMAIS sur GitHub
+#
+# Par défaut, rien de ce qui n'est pas indispensable au build ne part sur
+# GitHub. La documentation en particulier peut contenir de la donnée client :
+# elle reste sur le poste. Aucune donnée client réelle (nom, domaine, machine,
+# personne, IP) ne doit figurer où que ce soit dans ce dépôt.
+#
+# Toute exception se déclare en négation explicite plus bas, avec sa raison.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Documentation, notes, brouillons
+docs/
+doc/
+docs-*/
+*.md
+*.markdown
+*.txt
+HANDOFF*
+NOTES*
+TODO*
+PLAN.md
+
+# Scripts d'outillage qui nous sont propres (build local, déploiement, bench)
+*.bat
+*.cmd
+*.ps1
+*.psm1
+
+# Caches et données locales du poste
+.cache/
+
+# Répertoire de travail local (scripts, clés SSH)
+custom/
+
+# ── Exceptions : indispensables au build ou au runtime ────────────────────────
+# Servi au runtime par le serveur (GET /api/m365/enrol/script) et copié dans
+# dist/ par server/scripts/copy-assets.mjs. Sans lui, l'enrôlement M365 casse.
+!/server/src/services/m365/enrol.ps1
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Durcissement : le dépôt publié = de quoi BUILDER,
+# rien d'autre. Tout ce qui suit reste sur le poste et n'est jamais publié.
+# Toute exception se déclare en négation explicite, APRÈS ce bloc, avec sa raison.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Fichiers et dossiers cachés du poste (caches, sessions d'outils, éditeurs,
+# brouillons, vérifications locales) : tous ignorés, sauf ceux du build.
+.*
+!.gitignore
+!.gitattributes
+!.dockerignore
+!.env.example
+!.gitkeep
+/AGENTS*
+/REPRISE*
+/HANDOFF*
+/NOTES*
+/TODO*
+/PLAN*
+*.jsonl
+
+# Documentation, notes, exports bureautiques (peuvent contenir des données client)
+docs/
+doc/
+docs-*/
+*.md
+!/README.md
+*.markdown
+*.txt
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.csv
+*.tsv
+*.har
+*.pcap
+*.pcapng
+
+# Scripts d'outillage du poste (build, release, déploiement, bench)
+*.bat
+*.cmd
+*.ps1
+*.psm1
+*.py
+__pycache__/
+
+# Journaux, sauvegardes, restes d'édition
+*.log
+/logs/
+*.bak
+*.orig
+*.rej
+*.pre-*
+*.swp
+*~
+*.tmp
+
+# Bases et dumps locaux
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql.gz
+*.backup
+
+# Secrets, clés et certificats
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.csr
+*.jks
+*.keystore
+*.pfx
+*.p12
+*.p8
+*.ppk
+*.kdbx
+*.secret
+*.credentials
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.mobileprovision
+
+# Tests et données de test : restent sur le poste (non nécessaires au build)
+*.test.*
+*.spec.*
+*_test.go
+*.verify.ts
+*.selftest.ts
+__tests__/
+testdata/
+fixtures/
+golden/
+*.golden
+*.sample
+*.export
+**/testing/
+/server/test/
+/server/tests/
+/client/test/
+/client/tests/
+
+# Binaires et sorties de build (produits sur le poste, jamais versionnés)
+*.exe
+*.msi
+*.dll
+*.syso
+*.wixpdb
+*.wixobj
+*.dmg
+*.pkg
+*.zip
+*.7z
+*.tar.gz
+*.tgz
+
+# Données d'instance locales
+custom/
+
+# Restes d'un autre produit, lien local et outillage hors build
+/Obliview UUID/
+/obli.tools
+/agent/lhm_dlls/
+/tools/
+# Sorties de build de l'agent : produites sur le poste (Docker les reprend du
+# contexte local). Le marqueur garde le dossier pour le COPY du Dockerfile.
+/agent/dist/*
+!/agent/dist/.gitkeep
+
+# ── Exceptions : indispensables au build ou au runtime ────────────────────────
+# Servi au runtime par le serveur (GET /api/m365/enrol/script) et copié dans
+# dist/ par server/scripts/copy-assets.mjs. Sans lui, l'enrôlement M365 casse.
+!/server/src/services/m365/enrol.ps1

@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Obliguard Agent - Windows MSI Installer
+  Built with WiX v4+ on Windows.
+
+  Prerequisites (one-time setup):
+    dotnet tool install -g wix
+    go install (Go 1.22+, https://go.dev/dl)
+
+  Build (from agent/ directory):
+    the MSI build step of the release pipeline (wix build product.wxs)
+
+  Install command:
+    msiexec /i obliguard-agent.msi SERVERURL="https://..." APIKEY="your-key" /quiet
+
+  Self-signed server certificate (not in the Windows trust store): add
+    TLS_INSECURE=1   skip certificate verification on every server connection
+  TLS_INSECURE=0 turns verification back on; leaving it out keeps the value
+  already stored in config.json (silent self-updates never pass it).
+-->
+<!--
+  Two build lines from this ONE template (same UpgradeCode, service, folder and
+  component GUIDs: either MSI upgrades the other in place, MajorUpgrade on
+  Version, in both directions):
+    - modern (default): Go 1.22+ binary dist\obliguard-agent.exe.
+        wix build installer\_product_versioned.wxs -b . -arch x64 -out dist\obliguard-agent.msi
+    - nt6 (-d Nt6=1): Go 1.20 binary dist\obliguard-agent-nt6.exe (go120.mod,
+      -X main.buildFlavor=nt6) for Windows 7 SP1 / 8.1 / Server 2008 R2 / 2012 /
+      2012 R2. See agent\BUILD_NT6.txt.
+        wix build installer\_product_versioned.wxs -b . -arch x64 -d Nt6=1 -out dist\obliguard-agent-nt6.msi
+
+  The modern MSI deliberately has NO Windows 10 launch condition (unlike
+  Obliance): Windows NT 6.x hosts already run it, and agents older than the nt6
+  line still download obliguard-agent.msi to update. The server answers those
+  downloads with the nt6 MSI (server/src/services/agentNt6.service.ts), and a
+  modern agent >= the nt6 release on NT 6.x asks for the nt6 MSI itself. A
+  Windows 10 launch condition may be added once no pre-nt6 agent is left on
+  NT 6.x.
+-->
+<?ifdef Nt6?>
+<?define ProductName = "Obliguard Agent (Windows 7 / 8.1 / Server 2008 R2 / 2012)"?>
+<?define AgentExeSrc = "dist\obliguard-agent-nt6.exe"?>
+<?else?>
+<?define ProductName = "Obliguard Agent"?>
+<?define AgentExeSrc = "dist\obliguard-agent.exe"?>
+<?endif?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="$(var.ProductName)"
+           Manufacturer="Obliguard"
+           Version="AGENT_VERSION_PLACEHOLDER"
+           Language="1033"
+           UpgradeCode="8D56E26E-B218-4788-81B6-4E5088F285F6">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Obliguard Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+<?ifdef Nt6?>
+    <!-- nt6 MSI: Windows 7 SP1 / Server 2008 R2 SP1 (VersionNT 601) or later. -->
+    <Launch Condition="Installed OR (VersionNT &gt; 601) OR (VersionNT = 601 AND ServicePackLevel &gt;= 1)"
+            Message="This Obliguard Agent package requires Windows 7 SP1 / Windows Server 2008 R2 SP1 or later." />
+<?endif?>
+
+    <!-- Properties passed via: msiexec /i ... SERVERURL="..." APIKEY="..." -->
+    <Property Id="SERVERURL" Secure="yes" />
+    <Property Id="APIKEY" Secure="yes" />
+    <!-- Optional: 1 = tlsInsecureSkipVerify, 0 = verify; empty = keep config.json -->
+    <Property Id="TLS_INSECURE" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="ObliguardAgent">
+
+        <!--
+          The Go binary is a proper Windows service executable.
+          It calls SetServiceStatus(SERVICE_RUNNING) via golang.org/x/sys/windows/svc,
+          so the MSI Wait="yes" (default) resolves normally without hanging.
+          The url and key flags are passed as service arguments; on first run the
+          agent writes config.json and from then on reads that file directly.
+          tls-insecure is empty unless TLS_INSECURE is given, which leaves the
+          value persisted in config.json unchanged.
+        -->
+        <Component Id="AgentExe" Guid="A1B2C3D4-E5F6-7890-ABCD-EF1234560001">
+          <!--
+            DefaultVersion forces MSI to always overwrite the exe even when the binary on disk
+            has no Win32 version resource (Go binaries are unversioned by default).
+            Without this, MSI may skip the copy if it finds an "unversioned but modified" file
+            on disk (e.g. leftover from a failed previous install), leaving the wrong binary in place.
+            65535.0.0.0 is always greater than any real version, so the source file always wins.
+          -->
+          <File Id="AgentExeFile" Source="$(var.AgentExeSrc)" Name="obliguard-agent.exe"
+                DefaultVersion="65535.0.0.0" />
+          <ServiceInstall Id="AgentSvc"
+                          Name="ObliguardAgent"
+                          DisplayName="Obliguard Monitoring Agent"
+                          Description="Sends system metrics to the Obliguard monitoring platform."
+                          Start="auto"
+                          Type="ownProcess"
+                          Account="LocalSystem"
+                          ErrorControl="normal"
+                          Arguments='--url "[SERVERURL]" --key "[APIKEY]" --tls-insecure=[TLS_INSECURE]' />
+          <!--
+            SCM recovery actions (restart, restart, restart; reset after 1 day)
+            are applied by the agent itself at every service start
+            (service_windows.go ensureRecoveryActions): the MSI
+            ServiceConfigFailureActions table is documented as unreliable
+            (WIX1149) and util:ServiceConfig needs the WixToolset.Util
+            extension in the build. A stop requested through the SCM
+            (self-update, restart_windows.go) is not a failure.
+          -->
+          <ServiceControl Id="AgentSvcStart" Name="ObliguardAgent" Start="install" />
+          <ServiceControl Id="AgentSvcStop"  Name="ObliguardAgent" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+
+        <!--
+          Registry fallback: agent reads these on first run if config.json is absent
+          and the service arguments are not yet parsed (edge cases).
+          Written to 64-bit hive via -arch x64 build flag.
+        -->
+        <Component Id="AgentConfig" Guid="B2C3D4E5-F6A7-8901-BCDE-EF1234560002">
+          <RegistryValue Root="HKLM" Key="SOFTWARE\ObliguardAgent"
+                         Name="ServerUrl" Type="string" Value="[SERVERURL]" KeyPath="yes" />
+          <RegistryValue Root="HKLM" Key="SOFTWARE\ObliguardAgent"
+                         Name="ApiKey"    Type="string" Value="[APIKEY]" />
+        </Component>
+
+      </Directory>
+    </StandardDirectory>
+
+    <!--
+      Uninstall cleanup: once the service is stopped, the agent binary removes
+      every firewall object it created (WFP filters, sublayer and provider,
+      netsh Obliguard-Block-N rules, obliguard-banlist.txt) and, with the purge
+      option, its data under %ProgramData%\ObliguardAgent (config.json,
+      agent.log, update directory). Deferred, as SYSTEM, before RemoveFiles
+      deletes the binary. Skipped on a major upgrade (UPGRADINGPRODUCTCODE): the new
+      version keeps the bans and the config. Return="ignore": a cleanup
+      failure never blocks the uninstall.
+    -->
+    <CustomAction Id="AgentCleanup"
+                  FileRef="AgentExeFile"
+                  ExeCommand="cleanup-firewall --purge"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="AgentCleanup" After="StopServices"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main">
+      <ComponentRef Id="AgentExe" />
+      <ComponentRef Id="AgentConfig" />
+    </Feature>
+
+  </Package>
+</Wix>

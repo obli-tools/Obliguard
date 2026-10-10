@@ -1,0 +1,99 @@
+import { Router } from 'express';
+import { requireAuth } from '../middleware/auth';
+import { requireTenant } from '../middleware/tenant';
+import { require2faSetup } from '../middleware/require2faSetup';
+import authRoutes from './auth.routes';
+import tenantRoutes from './tenant.routes';
+import groupsRoutes from './groups.routes';
+import settingsRoutes from './settings.routes';
+import notificationsRoutes from './notifications.routes';
+import usersRoutes from './users.routes';
+import profileRoutes from './profile.routes';
+import teamsRoutes from './teams.routes';
+import agentRoutes from './agent.routes';
+import smtpServerRoutes from './smtpServer.routes';
+import appConfigRoutes from './appConfig.routes';
+import twoFactorRoutes from './twoFactor.routes';
+import { liveAlertRouter } from './liveAlert.routes';
+// Obliguard IPS routes
+import bansRoutes from './bans.routes';
+import whitelistRoutes from './whitelist.routes';
+import ipEventsRoutes from './ipEvents.routes';
+import ipReputationRoutes from './ipReputation.routes';
+import dashboardRoutes from './dashboard.routes';
+import ipDisplayNamesRoutes from './ipDisplayNames.routes';
+import serviceTemplatesRoutes from './serviceTemplates.routes';
+import geoRoutes from './geo.routes';
+import obligateCallbackRoutes from './obligateCallback.routes';
+import oblitoolsRoutes from './oblitools.routes';
+import systemRoutes from './system.routes';
+import permissionSetsRoutes from './permissionSets.routes';
+import mikrotikRoutes from './mikrotik.routes';
+import remoteBlocklistRoutes from './remoteBlocklist.routes';
+import rateLimitPoliciesRoutes from './rateLimitPolicies.routes';
+import externalBansRoutes from './externalBans.routes';
+import m365Routes from './m365.routes';
+import m365EnrolRoutes from './m365Enrol.routes';
+import auditRoutes from './audit.routes';
+
+const router = Router();
+
+// ── Cross-suite endpoints (delegation-token auth, not user session) ──────────
+// Called by sibling Obli apps (Oblihub honeypot pushes here). Auth is JWKS-verified via
+// Obligate; no requireAuth / requireTenant.
+router.use('/external-bans', externalBansRoutes);
+
+// ── Global (no tenant required) ──────────────────────────────────────────────
+router.use('/auth', authRoutes);
+router.use('/auth', obligateCallbackRoutes);      // Obligate SSO callback, sso-config, connected-apps
+router.use('/agent', agentRoutes);           // agent push (authenticated via API key)
+router.use('/admin/config', appConfigRoutes);
+router.use('/system', systemRoutes);         // system info / about (admin only, no tenant required)
+router.use('/profile/2fa', twoFactorRoutes); // must be before /profile
+router.use('/profile', profileRoutes);         // global: enrollment / profile / 2FA work without a tenant
+router.use('/live-alerts', liveAlertRouter);
+router.use('/oblitools', oblitoolsRoutes);   // ObliTools desktop manifest (auth required)
+router.use('/m365/enrol', m365EnrolRoutes);  // enrôlement M365 (authentifié par jeton à usage unique, sans session)
+router.use('/permission-sets', permissionSetsRoutes);
+
+// ── Tenant management ─────────────────────────────────────────────────────────
+router.use('/tenants', tenantRoutes);
+router.use('/tenant', tenantRoutes);
+
+// ── Tenant-scoped routes (requireAuth + requireTenant) ────────────────────────
+const tenantRouter = Router();
+tenantRouter.use(requireAuth);
+tenantRouter.use(requireTenant);
+// force_2fa (app_config) enforced server-side: an account without a second
+// factor gets 403 twoFactorSetupRequired here. /auth, /profile and
+// /profile/2fa are mounted above, outside this router, so they stay reachable.
+tenantRouter.use(require2faSetup);
+
+// Infrastructure (retained from Obliview base)
+tenantRouter.use('/groups', groupsRoutes);
+tenantRouter.use('/settings', settingsRoutes);
+tenantRouter.use('/notifications', notificationsRoutes);
+tenantRouter.use('/users', usersRoutes);
+tenantRouter.use('/teams', teamsRoutes);
+tenantRouter.use('/admin/smtp-servers', smtpServerRoutes);
+
+// Obliguard IPS
+tenantRouter.use('/bans', bansRoutes);
+tenantRouter.use('/whitelist', whitelistRoutes);
+tenantRouter.use('/ip-events', ipEventsRoutes);
+tenantRouter.use('/ip-reputation', ipReputationRoutes);
+tenantRouter.use('/dashboard', dashboardRoutes);
+  tenantRouter.use('/ip-labels', ipDisplayNamesRoutes);
+tenantRouter.use('/service-templates', serviceTemplatesRoutes);
+tenantRouter.use('/geo', geoRoutes);
+tenantRouter.use('/mikrotik', mikrotikRoutes);
+tenantRouter.use('/m365', m365Routes);
+tenantRouter.use('/remote-blocklists', remoteBlocklistRoutes);
+tenantRouter.use('/rate-limit-policies', rateLimitPoliciesRoutes);
+
+// Administration
+tenantRouter.use('/audit-log', auditRoutes);    // audit trail (audit.read; Default = god view)
+
+router.use('/', tenantRouter);
+
+export { router as routes };

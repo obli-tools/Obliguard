@@ -1,0 +1,744 @@
+import { useState, useEffect, type FormEvent } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
+import { User, Save, KeyRound, Bell, CheckCircle2, AlertTriangle, QrCode, Mail, ArrowLeftRight, Palette, Star } from 'lucide-react';
+import { ThemePicker } from '@/components/common/ThemePicker';
+import { loadSavedTheme, type AppTheme } from '@/utils/theme';
+import { profileApi } from '@/api/profile.api';
+import { appConfigApi } from '@/api/appConfig.api';
+import { twoFactorApi, type TwoFactorStatus, type FactorProof } from '@/api/twoFactor.api';
+import { useAuthStore } from '@/store/authStore';
+import { useTenantStore } from '@/store/tenantStore';
+import { useLiveAlertsStore } from '@/store/liveAlertsStore';
+import { Button } from '@/components/common/Button';
+import { Input } from '@/components/common/Input';
+import { SUPPORTED_LANGUAGES, setLanguage } from '@/i18n';
+import toast from 'react-hot-toast';
+
+type FactorAction = 'totpSetup' | 'totpDisable' | 'emailSetup' | 'emailDisable';
+
+export function ProfilePage() {
+  const { t } = useTranslation();
+  const { user: sessionUser, requires2faSetup, preferredTenantId, setDefaultTenant, checkSession } = useAuthStore();
+  const tenants = useTenantStore((st) => st.tenants);
+  const [savingFavourite, setSavingFavourite] = useState(false);
+
+  // Favourite workspace: also reachable here because the TenantSwitcher (and its
+  // star) is replaced by the tab bar in the native desktop app.
+  const handleFavouriteChange = async (value: string) => {
+    setSavingFavourite(true);
+    try {
+      await setDefaultTenant(value === '' ? null : Number(value));
+      toast.success(t('common.saved', 'Saved'));
+    } catch {
+      toast.error(t('common.error', 'Error'));
+    } finally {
+      setSavingFavourite(false);
+    }
+  };
+  const [obligateUrl, setObligateUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (sessionUser?.foreignSource === 'obligate') {
+      appConfigApi.getConfig().then(cfg => {
+        const url = (cfg as any).obligate_url ?? (cfg as any).obligateUrl ?? null;
+        setObligateUrl(url);
+      }).catch(() => {});
+    }
+  }, [sessionUser]);
+  const { localEnabled: alertEnabled, position: alertPosition, setEnabled, setPosition } = useLiveAlertsStore();
+
+  const [displayName, setDisplayName] = useState('');
+  const [email, setEmail] = useState('');
+  // The stored address: changing it asks the current password (it receives
+  // password-reset links and e-mail codes).
+  const [originalEmail, setOriginalEmail] = useState('');
+  const [emailPassword, setEmailPassword] = useState('');
+  const [preferredLanguage, setPreferredLanguage] = useState('');
+  const [savingProfile, setSavingProfile] = useState(false);
+
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [savingPassword, setSavingPassword] = useState(false);
+
+  const [savingPrefs, setSavingPrefs] = useState(false);
+  const [preferredTheme, setPreferredTheme] = useState<AppTheme>(loadSavedTheme);
+
+  // 2FA state
+  const [allow2fa, setAllow2fa] = useState(false);
+  const [tfaStatus, setTfaStatus] = useState<TwoFactorStatus | null>(null);
+
+  // TOTP setup flow
+  const [totpSetupData, setTotpSetupData] = useState<{ secret: string; qrDataUrl: string } | null>(null);
+  const [totpCode, setTotpCode] = useState('');
+  const [totpSaving, setTotpSaving] = useState(false);
+
+  // Email OTP setup flow (codes go to the profile address)
+  const [emailSetupStep, setEmailSetupStep] = useState<'idle' | 'sent'>('idle');
+  const [emailSentTo, setEmailSentTo] = useState('');
+  const [emailCode, setEmailCode] = useState('');
+  const [emailSaving, setEmailSaving] = useState(false);
+
+  // Factor-change proof: adding, replacing or removing a second factor asks
+  // for a current authenticator code (TOTP on) or the current password.
+  const [proofAction, setProofAction] = useState<FactorAction | null>(null);
+  const [proofValue, setProofValue] = useState('');
+  const [proofBusy, setProofBusy] = useState(false);
+  const proofKind: 'totp' | 'password' = tfaStatus?.totpEnabled ? 'totp' : 'password';
+
+  const [searchParams] = useSearchParams();
+  const setup2fa = searchParams.get('setup2fa') === '1';
+
+  useEffect(() => {
+    profileApi.get().then((profile) => {
+      setDisplayName(profile.displayName || '');
+      setEmail((profile as any).email || '');
+      setOriginalEmail((profile as any).email || '');
+      setPreferredLanguage((profile as any).preferredLanguage || '');
+    });
+    appConfigApi.getConfig().then((cfg) => {
+      setAllow2fa(cfg.allow_2fa);
+    }).catch(() => {});
+    twoFactorApi.getStatus().then(setTfaStatus).catch(() => {});
+  }, []);
+
+  const emailChanged = email.trim().toLowerCase() !== originalEmail.trim().toLowerCase();
+  const emailNeedsPassword = emailChanged && sessionUser?.foreignSource !== 'obligate';
+
+  const handleProfileSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setSavingProfile(true);
+    try {
+      await profileApi.update({
+        displayName: displayName || null,
+        email: email || null,
+        preferredLanguage: preferredLanguage || undefined,
+        ...(emailNeedsPassword ? { currentPassword: emailPassword } : {}),
+      });
+      setOriginalEmail(email);
+      setEmailPassword('');
+      toast.success(t('profile.profileUpdated'));
+    } catch (err: any) {
+      const status = err?.response?.status;
+      const msg = err?.response?.data?.error;
+      // 400 wrong / missing current password, 409 address in use, 429 throttled.
+      toast.error(status && status !== 500 && msg ? msg : t('profile.failedProfile'));
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const handlePasswordSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+
+    if (newPassword !== confirmPassword) {
+      toast.error(t('profile.password.mismatch'));
+      return;
+    }
+
+    if (newPassword.length < 6) {
+      toast.error(t('profile.password.tooShort'));
+      return;
+    }
+
+    setSavingPassword(true);
+    try {
+      await profileApi.changePassword(currentPassword, newPassword);
+      toast.success(t('profile.password.changed'));
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+    } catch (err: any) {
+      const msg = err?.response?.data?.error || t('profile.password.failed');
+      toast.error(msg);
+    } finally {
+      setSavingPassword(false);
+    }
+  };
+
+  const handleSavePreferences = async () => {
+    setSavingPrefs(true);
+    try {
+      await profileApi.update({
+        preferences: {
+          toastEnabled: alertEnabled,
+          toastPosition: alertPosition,
+        },
+      });
+      toast.success(t('profile.alerts.preferencesSaved'));
+    } catch {
+      toast.error(t('profile.alerts.failedPreferences'));
+    } finally {
+      setSavingPrefs(false);
+    }
+  };
+
+  const handleLanguageChange = async (code: string) => {
+    setPreferredLanguage(code);
+    setLanguage(code);
+    try {
+      await profileApi.update({ preferredLanguage: code });
+    } catch {
+      // non-critical, ignore
+    }
+  };
+
+  // ?setup2fa=1 (force_2fa redirect): bring the 2FA section into view.
+  useEffect(() => {
+    if (!setup2fa || !tfaStatus) return;
+    document.getElementById('security-2fa')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [setup2fa, tfaStatus]);
+
+  /** Server message for 4xx answers (e.g. "This code was already used"), else the fallback. */
+  const serverError = (err: unknown, fallback: string): string => {
+    const r = (err as { response?: { status?: number; data?: { error?: string; proofInvalid?: boolean } } })?.response;
+    if (r?.data?.proofInvalid) return t('profile.security.invalidProof', 'Invalid code or password');
+    if (r?.status === 429) return r.data?.error || fallback;
+    return r?.status && r.status < 500 && r.data?.error ? r.data.error : fallback;
+  };
+
+  /** A factor was added or removed: refresh the session state (force_2fa gate:
+   *  the last factor removed turns it on, a first factor turns it off). */
+  const afterFactorChange = async () => {
+    await checkSession().catch(() => {});
+  };
+
+  /** A first TOTP enrolment (no factor yet) needs no proof; every other change does. */
+  const needsProof = (action: FactorAction): boolean =>
+    action !== 'totpSetup' || !!(tfaStatus?.totpEnabled || tfaStatus?.emailOtpEnabled);
+
+  const runFactorAction = async (action: FactorAction, proof: FactorProof): Promise<boolean> => {
+    try {
+      if (action === 'totpSetup') {
+        const data = await twoFactorApi.totpSetup(proof);
+        setTotpSetupData(data);
+        setTotpCode('');
+      } else if (action === 'totpDisable') {
+        await twoFactorApi.totpDisable(proof);
+        setTfaStatus((s) => s ? { ...s, totpEnabled: false } : s);
+        toast.success(t('profile.security.totpDisabled'));
+        await afterFactorChange();
+      } else if (action === 'emailSetup') {
+        await twoFactorApi.emailSetup(proof);
+        setEmailSentTo(originalEmail);
+        setEmailSetupStep('sent');
+        setEmailCode('');
+        toast.success(t('profile.security.codeSent'));
+      } else {
+        await twoFactorApi.emailDisable(proof);
+        setTfaStatus((s) => s ? { ...s, emailOtpEnabled: false } : s);
+        toast.success(t('profile.security.emailOtpDisabled'));
+        await afterFactorChange();
+      }
+      return true;
+    } catch (err) {
+      const fallback = action === 'totpSetup' ? t('profile.security.failedStartTotp')
+        : action === 'totpDisable' ? t('profile.security.failedDisableTotp')
+        : action === 'emailSetup' ? t('profile.security.failedSendCode')
+        : t('profile.security.failedDisableEmailOtp');
+      toast.error(serverError(err, fallback));
+      return false;
+    }
+  };
+
+  const startFactorAction = (action: FactorAction) => {
+    if (!needsProof(action)) { void runFactorAction(action, {}); return; }
+    setProofValue('');
+    setProofAction(action);
+  };
+
+  const submitProof = async () => {
+    if (!proofAction || !proofValue) return;
+    setProofBusy(true);
+    const proof: FactorProof = proofKind === 'totp' ? { currentCode: proofValue } : { currentPassword: proofValue };
+    const ok = await runFactorAction(proofAction, proof);
+    setProofBusy(false);
+    if (ok) { setProofAction(null); setProofValue(''); }
+  };
+
+  const renderProofForm = () => (
+    <div className="space-y-2">
+      <p className="text-xs text-text-muted">
+        {proofKind === 'totp'
+          ? t('profile.security.proofTotpHint', 'Confirm with a current code of your authenticator app.')
+          : t('profile.security.proofPasswordHint', 'Confirm with your current password.')}
+      </p>
+      <div className="flex items-end gap-2">
+        <div className="flex-1">
+          {proofKind === 'totp' ? (
+            <Input
+              label={t('profile.security.proofTotpLabel', 'Current authenticator code')}
+              type="text"
+              inputMode="numeric"
+              value={proofValue}
+              onChange={(e) => setProofValue(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="000000"
+              autoComplete="one-time-code"
+              autoFocus
+            />
+          ) : (
+            <Input
+              label={t('profile.security.proofPasswordLabel', 'Current password')}
+              type="password"
+              value={proofValue}
+              onChange={(e) => setProofValue(e.target.value)}
+              placeholder={t('profile.password.currentPlaceholder')}
+              autoComplete="current-password"
+              autoFocus
+            />
+          )}
+        </div>
+        <Button
+          disabled={proofBusy || (proofKind === 'totp' ? proofValue.length !== 6 : !proofValue)}
+          loading={proofBusy}
+          onClick={() => { void submitProof(); }}
+        >
+          {t('common.confirm')}
+        </Button>
+        <Button variant="ghost" onClick={() => { setProofAction(null); setProofValue(''); }}>{t('common.cancel')}</Button>
+      </div>
+    </div>
+  );
+
+  if (sessionUser?.foreignSource === 'obligate' && obligateUrl) {
+    return (
+      <div className="p-6 max-w-2xl mx-auto">
+        <div className="bg-bg-secondary border border-border rounded-lg p-6 text-center">
+          <h2 className="text-lg font-medium text-text-primary mb-2">{t('profile.obligate.title', { defaultValue: 'Profile managed by Obligate' })}</h2>
+          <p className="text-sm text-text-secondary mb-4">
+            {t('profile.obligate.desc', { defaultValue: 'Your profile, password, and preferences are managed centrally through Obligate SSO.' })}
+          </p>
+          <a
+            href={`${obligateUrl}/account`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-md font-medium text-sm transition-colors"
+          >
+            {t('profile.obligate.open', { defaultValue: 'Open Obligate Profile' })}
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 min-w-0">
+      <h1 className="text-2xl font-semibold text-text-primary mb-6">{t('profile.title')}</h1>
+
+      {/* Profile section */}
+      <form onSubmit={handleProfileSubmit} className="mb-8">
+        <div className="rounded-lg border border-border bg-bg-secondary p-5 space-y-4">
+          <div className="flex items-center gap-2 mb-2">
+            <User size={18} className="text-accent" />
+            <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wide">
+              {t('profile.sectionProfile')}
+            </h2>
+          </div>
+
+          <div className="space-y-1">
+            <label className="block text-sm font-medium text-text-secondary">{t('profile.usernameLabel')}</label>
+            <div className="flex items-center gap-2">
+              <p className="text-sm text-text-primary font-mono bg-bg-tertiary rounded-md px-3 py-2 flex-1">
+                {sessionUser?.username}
+              </p>
+              {sessionUser?.foreignSource && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-[#1e1b4b]/60 border border-[#4338ca]/40 px-2 py-1 text-[10px] font-medium text-[#a5b4fc] shrink-0">
+                  <ArrowLeftRight size={9} />SSO · {sessionUser.foreignSource}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <Input
+            label={t('profile.displayNameLabel')}
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            placeholder={t('profile.displayNamePlaceholder')}
+          />
+
+          <div>
+            <Input
+              label={t('profile.emailLabel')}
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder={t('profile.emailPlaceholder')}
+            />
+            <p className="mt-1 text-xs text-text-muted">{t('profile.emailHint')}</p>
+          </div>
+
+          {emailNeedsPassword && (
+            <Input
+              label={t('profile.emailCurrentPassword', 'Current password (required to change the email address)')}
+              type="password"
+              value={emailPassword}
+              onChange={(e) => setEmailPassword(e.target.value)}
+              placeholder={t('profile.password.currentPlaceholder')}
+              autoComplete="current-password"
+              required
+            />
+          )}
+
+          <div className="space-y-1">
+            <label className="block text-sm font-medium text-text-secondary">{t('profile.preferredLanguage')}</label>
+            <select
+              value={preferredLanguage}
+              onChange={(e) => handleLanguageChange(e.target.value)}
+              className="w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
+            >
+              {SUPPORTED_LANGUAGES.map((lang) => (
+                <option key={lang.code} value={lang.code}>
+                  {lang.nativeName} ({lang.name})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <Button type="submit" loading={savingProfile}>
+            <Save size={16} className="mr-1.5" />
+            {t('profile.saveProfile')}
+          </Button>
+        </div>
+      </form>
+
+      {/* Password section */}
+      {sessionUser?.foreignSource !== 'obligate' && (
+        <form onSubmit={handlePasswordSubmit} className="mb-8">
+          <div className="rounded-lg border border-border bg-bg-secondary p-5 space-y-4">
+            <div className="flex items-center gap-2 mb-2">
+              <KeyRound size={18} className="text-accent" />
+              <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wide">
+                {t('profile.password.title')}
+              </h2>
+            </div>
+
+            <Input
+              label={t('profile.password.current')}
+              type="password"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              placeholder={t('profile.password.currentPlaceholder')}
+              required
+            />
+
+            <Input
+              label={t('profile.password.new')}
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder={t('profile.password.newPlaceholder')}
+              required
+            />
+
+            <Input
+              label={t('profile.password.confirm')}
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              placeholder={t('profile.password.confirmPlaceholder')}
+              required
+            />
+
+            <Button type="submit" loading={savingPassword}>
+              <KeyRound size={16} className="mr-1.5" />
+              {t('profile.password.change')}
+            </Button>
+          </div>
+        </form>
+      )}
+
+      {/* Favourite workspace section */}
+      {tenants.length > 1 && (
+        <div className="mb-8">
+          <div className="rounded-lg border border-border bg-bg-secondary p-5 space-y-4">
+            <div className="flex items-center gap-2 mb-2">
+              <Star size={18} className="text-accent" />
+              <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wide">
+                {t('tenant.favouriteLabel', 'Favourite workspace')}
+              </h2>
+            </div>
+            <select
+              value={preferredTenantId != null ? String(preferredTenantId) : ''}
+              onChange={(e) => handleFavouriteChange(e.target.value)}
+              disabled={savingFavourite}
+              className="w-full rounded-md border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
+            >
+              <option value="">{t('tenant.noFavourite', 'None (first workspace)')}</option>
+              {tenants.map((tn) => (
+                <option key={tn.id} value={String(tn.id)}>{tn.name}</option>
+              ))}
+            </select>
+            <p className="text-xs text-text-muted">{t('tenant.favouriteHint', 'The favourite workspace opens at sign-in')}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Live Alert Notifications section */}
+      <div className="mb-8">
+        <div className="rounded-lg border border-border bg-bg-secondary p-5 space-y-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Bell size={18} className="text-accent" />
+            <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wide">
+              {t('profile.alerts.title')}
+            </h2>
+          </div>
+
+          {/* Enabled toggle */}
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-text-primary">{t('profile.alerts.enableLabel')}</p>
+              <p className="text-xs text-text-muted mt-0.5">
+                {t('profile.alerts.enableDesc')}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setEnabled(!alertEnabled)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
+                alertEnabled ? 'bg-accent' : 'bg-bg-tertiary'
+              }`}
+              aria-pressed={alertEnabled}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                  alertEnabled ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+
+          {/* Position selector */}
+          <div>
+            <p className="text-sm font-medium text-text-primary mb-2">{t('profile.alerts.positionLabel')}</p>
+            <div className="flex flex-col gap-3">
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="radio"
+                  name="alertPosition"
+                  value="bottom-right"
+                  checked={alertPosition === 'bottom-right'}
+                  onChange={() => setPosition('bottom-right')}
+                  className="accent-accent mt-0.5"
+                />
+                <div>
+                  <span className="text-sm text-text-primary">{t('profile.alerts.bottomRight')}</span>
+                  <p className="text-xs text-text-muted">
+                    {t('profile.alerts.bottomRightDesc')}
+                  </p>
+                </div>
+              </label>
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="radio"
+                  name="alertPosition"
+                  value="top-center"
+                  checked={alertPosition === 'top-center'}
+                  onChange={() => setPosition('top-center')}
+                  className="accent-accent mt-0.5"
+                />
+                <div>
+                  <span className="text-sm text-text-primary">{t('profile.alerts.topCenter')}</span>
+                  <p className="text-xs text-text-muted">
+                    {t('profile.alerts.topCenterDesc')}
+                  </p>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <Button type="button" onClick={handleSavePreferences} loading={savingPrefs}>
+            <Save size={16} className="mr-1.5" />
+            {t('profile.alerts.savePreferences')}
+          </Button>
+        </div>
+      </div>
+
+      {/* Security / 2FA section */}
+      {(allow2fa || requires2faSetup || tfaStatus?.totpEnabled || tfaStatus?.emailOtpEnabled) && (
+        <div id="security-2fa" className="mb-8">
+          <h2 className="text-lg font-semibold text-text-primary mb-4">{t('profile.security.title')}</h2>
+
+          {requires2faSetup && (
+            <div className="mb-4 flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
+              <AlertTriangle size={16} className="text-amber-400 mt-0.5 shrink-0" />
+              <p className="text-sm text-amber-300">
+                {t('profile.security.force2faWarning')}
+              </p>
+            </div>
+          )}
+
+          <div className="rounded-lg border border-border bg-bg-secondary divide-y divide-border">
+            {/* TOTP */}
+            <div className="p-5 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <QrCode size={16} className="text-text-muted" />
+                  <p className="text-sm font-medium text-text-primary">{t('profile.security.totp')}</p>
+                  {tfaStatus?.totpEnabled && <CheckCircle2 size={14} className="text-green-400" />}
+                </div>
+                {!totpSetupData && proofAction === null && (
+                  tfaStatus?.totpEnabled ? (
+                    <div className="flex gap-2">
+                      <Button size="sm" variant="ghost" onClick={() => startFactorAction('totpSetup')}>
+                        {t('profile.security.replace', 'Replace')}
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={() => startFactorAction('totpDisable')}>
+                        {t('common.disable')}
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button size="sm" onClick={() => startFactorAction('totpSetup')}>
+                      {t('common.enable')}
+                    </Button>
+                  )
+                )}
+              </div>
+
+              {(proofAction === 'totpSetup' || proofAction === 'totpDisable') && renderProofForm()}
+
+              {totpSetupData && (
+                <div className="space-y-3">
+                  <p className="text-xs text-text-muted">{t('profile.security.totpScanDesc')}</p>
+                  <img src={totpSetupData.qrDataUrl} alt={t('profile.security.totpQrAlt', { defaultValue: 'TOTP QR Code' })} className="w-40 h-40 rounded-lg border border-border" />
+                  <p className="text-xs text-text-muted font-mono break-all">{t('profile.security.totpSecret', { secret: totpSetupData.secret })}</p>
+                  <div className="flex items-end gap-2">
+                    <div className="flex-1">
+                      <Input
+                        label={t('profile.security.verificationCode')}
+                        type="text"
+                        inputMode="numeric"
+                        value={totpCode}
+                        onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                        placeholder="000000"
+                      />
+                    </div>
+                    <Button
+                      disabled={totpCode.length !== 6 || totpSaving}
+                      loading={totpSaving}
+                      onClick={async () => {
+                        setTotpSaving(true);
+                        const replacing = !!tfaStatus?.totpEnabled;
+                        try {
+                          await twoFactorApi.totpEnable(totpCode);
+                          setTfaStatus((s) => s ? { ...s, totpEnabled: true } : s);
+                          setTotpSetupData(null);
+                          setTotpCode('');
+                          toast.success(replacing
+                            ? t('profile.security.totpReplaced', 'Authenticator app replaced')
+                            : t('profile.security.totpEnabled'));
+                          await afterFactorChange();
+                        } catch (err) { toast.error(serverError(err, t('profile.security.invalidCode'))); }
+                        finally { setTotpSaving(false); }
+                      }}
+                    >
+                      {t('common.confirm')}
+                    </Button>
+                    <Button variant="ghost" onClick={() => { setTotpSetupData(null); setTotpCode(''); }}>{t('common.cancel')}</Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Email OTP */}
+            <div className="p-5 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Mail size={16} className="text-text-muted" />
+                  <p className="text-sm font-medium text-text-primary">{t('profile.security.emailOtp')}</p>
+                  {tfaStatus?.emailOtpEnabled && (
+                    <>
+                      <CheckCircle2 size={14} className="text-green-400" />
+                      <span className="text-xs text-text-muted">{tfaStatus.email}</span>
+                    </>
+                  )}
+                </div>
+                {proofAction === null && emailSetupStep === 'idle' && (
+                  tfaStatus?.emailOtpEnabled ? (
+                    <Button size="sm" variant="ghost" onClick={() => startFactorAction('emailDisable')}>
+                      {t('common.disable')}
+                    </Button>
+                  ) : (
+                    <Button size="sm" disabled={!originalEmail} onClick={() => startFactorAction('emailSetup')}>
+                      {t('common.enable')}
+                    </Button>
+                  )
+                )}
+              </div>
+
+              {!tfaStatus?.emailOtpEnabled && emailSetupStep === 'idle' && proofAction === null && (
+                <p className="text-xs text-text-muted">
+                  {originalEmail
+                    ? t('profile.security.emailOtpTarget', { email: originalEmail, defaultValue: 'Codes are sent to {{email}} (the address of your profile).' })
+                    : t('profile.security.emailOtpNoAddress', 'Set an e-mail address in your profile first.')}
+                </p>
+              )}
+
+              {(proofAction === 'emailSetup' || proofAction === 'emailDisable') && renderProofForm()}
+
+              {!tfaStatus?.emailOtpEnabled && emailSetupStep === 'sent' && (
+                <div className="space-y-3">
+                  <p className="text-xs text-text-muted">{t('profile.security.enterCode', { email: emailSentTo })}</p>
+                  <div className="flex items-end gap-2">
+                    <div className="flex-1">
+                      <Input
+                        label={t('profile.security.verificationCode')}
+                        type="text"
+                        inputMode="numeric"
+                        value={emailCode}
+                        onChange={(e) => setEmailCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                        placeholder="000000"
+                        autoFocus
+                      />
+                    </div>
+                    <Button
+                      disabled={emailCode.length !== 6 || emailSaving}
+                      loading={emailSaving}
+                      onClick={async () => {
+                        setEmailSaving(true);
+                        try {
+                          await twoFactorApi.emailEnable(emailCode);
+                          const status = await twoFactorApi.getStatus();
+                          setTfaStatus(status);
+                          setEmailSetupStep('idle');
+                          setEmailCode('');
+                          toast.success(t('profile.security.emailOtpEnabled'));
+                          await afterFactorChange();
+                        } catch (err) { toast.error(serverError(err, t('profile.security.invalidCode'))); }
+                        finally { setEmailSaving(false); }
+                      }}
+                    >
+                      {t('common.confirm')}
+                    </Button>
+                    <Button variant="ghost" onClick={() => { setEmailSetupStep('idle'); setEmailCode(''); }}>{t('common.cancel')}</Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Appearance ─────────────────────────────────────────────────────── */}
+      <div className="mb-8">
+        <div className="rounded-lg border border-border bg-bg-secondary p-5 space-y-4">
+          <div className="flex items-center gap-2 mb-2">
+            <Palette size={18} className="text-accent" />
+            <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wide">
+              {t('profile.appearance', { defaultValue: 'Appearance' })}
+            </h2>
+          </div>
+          <ThemePicker
+            value={preferredTheme}
+            onChange={(theme) => {
+              setPreferredTheme(theme);
+              profileApi.update({
+                preferences: { toastEnabled: alertEnabled, toastPosition: alertPosition, preferredTheme: theme },
+              }).catch(() => {});
+            }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,280 @@
+import type { Request, Response } from 'express';
+import crypto from 'crypto';
+import { db } from '../db';
+import { logger } from '../utils/logger';
+import { mikrotikDeviceService } from '../services/mikrotik/mikrotikDevice.service';
+import { mikrotikBanSync } from '../services/mikrotik/mikrotikBanSync.service';
+import { mikrotikImport } from '../services/mikrotik/mikrotikImport.service';
+import { parseMikroTikSyslog } from '../services/mikrotik/syslogParser';
+import { agentService, markMikrotikSeen } from '../services/agent.service';
+import { checkRequestDeviceAccess } from '../services/deviceAccess.service';
+import { auditService } from '../services/audit.service';
+
+/** Audit row of a router action (linked to the router's agent row; never a credential value). */
+function auditRouter(req: Request, deviceId: number, action: string, details: Record<string, unknown> = {}, success = true): Promise<void> {
+  return auditService.logReq(req, { action, targetType: 'agent', targetId: deviceId, deviceId, success, details });
+}
+import type { AgentIpEvent } from '@obliview/shared';
+
+/**
+ * Every MikroTik :id route: the device must belong to the operating
+ * tenant — credentials (incl. the ingest token) are never god-viewed, so even
+ * reads use the same-tenant 'write' rule. 403 from Default, 404 elsewhere,
+ * 404 for a non-MikroTik device. Returns the device id, or null (answered).
+ */
+async function requireOwnMikrotik(req: Request, res: Response): Promise<number | null> {
+  const r = await checkRequestDeviceAccess(req, req.params.id, 'write');
+  if (!r.ok) {
+    res.status(r.status).json({ error: r.error });
+    return null;
+  }
+  if (r.row.device_type !== 'mikrotik') {
+    res.status(404).json({ error: 'MikroTik device not found' });
+    return null;
+  }
+  return r.row.id;
+}
+
+/** POST /mikrotik: a new router in the operating tenant (integrations.mikrotik, route). */
+export async function createMikroTikDevice(req: Request, res: Response): Promise<void> {
+  try {
+    const tenantId = req.tenantId;
+    const userId = req.session.userId!;
+
+    const { name, hostname, groupId, apiHost, apiPort, apiUseTls, apiUsername, apiPassword, syslogIdentifier, addressListName } = req.body;
+
+    if (!name || !hostname || !apiHost || !apiUsername || !apiPassword || !syslogIdentifier) {
+      res.status(400).json({ error: 'Missing required fields: name, hostname, apiHost, apiUsername, apiPassword, syslogIdentifier' });
+      return;
+    }
+
+    // The router's group must belong to the operating tenant.
+    if (groupId != null && !(Number.isInteger(Number(groupId)) && await agentService.isGroupInTenant(Number(groupId), tenantId))) {
+      res.status(400).json({ error: 'Invalid group' });
+      return;
+    }
+
+    const result = await mikrotikDeviceService.create(
+      { name, hostname, groupId, apiHost, apiPort, apiUseTls, apiUsername, apiPassword, syslogIdentifier, addressListName },
+      tenantId,
+      userId,
+    );
+    await auditRouter(req, result.deviceId, 'mikrotik.created', {
+      name, hostname, apiHost, apiPort: apiPort ?? null, apiUseTls: apiUseTls ?? null, apiUsername, groupId: groupId ?? null,
+    });
+
+    res.status(201).json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    res.status(400).json({ error: msg });
+  }
+}
+
+export async function getMikroTikCredentials(req: Request, res: Response): Promise<void> {
+  try {
+    const deviceId = await requireOwnMikrotik(req, res);
+    if (deviceId === null) return;
+    const creds = await mikrotikDeviceService.getCredentials(deviceId);
+    if (!creds) {
+      res.status(404).json({ error: 'MikroTik credentials not found' });
+      return;
+    }
+    await auditRouter(req, deviceId, 'mikrotik.credentials_viewed');
+    res.json(creds);
+  } catch (err) {
+    res.status(500).json({ error: 'Internal error' });
+  }
+}
+
+export async function updateMikroTikCredentials(req: Request, res: Response): Promise<void> {
+  try {
+    const deviceId = await requireOwnMikrotik(req, res);
+    if (deviceId === null) return;
+    await mikrotikDeviceService.updateCredentials(deviceId, req.body);
+    // Field names only: the values (password, token) are never audited.
+    await auditRouter(req, deviceId, 'mikrotik.credentials_updated', {
+      fields: Object.keys((req.body ?? {}) as object).slice(0, 50),
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    res.status(400).json({ error: msg });
+  }
+}
+
+export async function testMikroTikConnection(req: Request, res: Response): Promise<void> {
+  try {
+    const deviceId = await requireOwnMikrotik(req, res);
+    if (deviceId === null) return;
+    const result = await mikrotikDeviceService.testConnection(deviceId);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Internal error' });
+  }
+}
+
+export async function syncMikroTikBans(req: Request, res: Response): Promise<void> {
+  try {
+    const deviceId = await requireOwnMikrotik(req, res);
+    if (deviceId === null) return;
+    const result = await mikrotikBanSync.fullSync(deviceId);
+    await auditRouter(req, deviceId, 'mikrotik.bans_synced');
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'Internal error' });
+  }
+}
+
+export async function clearMikroTikLogCache(req: Request, res: Response): Promise<void> {
+  try {
+    const deviceId = await requireOwnMikrotik(req, res);
+    if (deviceId === null) return;
+    const { mikrotikLogPoller } = await import('../services/mikrotik/mikrotikLogPoller.service');
+    mikrotikLogPoller.clearCache(deviceId);
+    res.json({ ok: true, message: `Cache cleared${deviceId ? ` for device ${deviceId}` : ' (all)'}. Next poll will re-seed.` });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal error' });
+  }
+}
+
+export async function debugMikroTikLogs(req: Request, res: Response): Promise<void> {
+  try {
+    const deviceId = await requireOwnMikrotik(req, res);
+    if (deviceId === null) return;
+    const { createRouterOSClient } = await import('../services/mikrotik/routerosClient');
+    const { mikrotikDeviceService } = await import('../services/mikrotik/mikrotikDevice.service');
+    const cfg = await mikrotikDeviceService.getRouterOSConfig(deviceId);
+    if (!cfg) { res.status(404).json({ error: 'Credentials not found' }); return; }
+
+    const client = await createRouterOSClient({
+      host: cfg.host, port: cfg.port, useTls: cfg.useTls,
+      username: cfg.username, password: cfg.password,
+      deviceId,
+    });
+    // Try to get raw response first for debugging
+    const rawResult = await client.sendCommand(['/log/print']);
+    const entries = await client.getLogEntries();
+    client.close();
+
+    // Show last 20 entries with parse result
+    const { parseMikroTikSyslog } = await import('../services/mikrotik/syslogParser');
+    const last20 = entries.slice(-20).map((e) => ({
+      id: e.id,
+      time: e.time,
+      topics: e.topics,
+      message: e.message,
+      parsed: parseMikroTikSyslog(e.message),
+    }));
+
+    // Also show raw API response (first 5 sentences) for debugging
+    const rawSample = rawResult.slice(0, 5).map((s) => s.join(' | '));
+
+    res.json({ total: entries.length, rawSentences: rawSample, last20 });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+}
+
+/** POST /mikrotik/import/poll: one import cycle over every tenant's routers (platform admin, route). */
+export async function pollMikroTikImport(req: Request, res: Response): Promise<void> {
+  try {
+    await mikrotikImport.pollNow();
+    await auditService.logReq(req, { action: 'mikrotik.import_polled', targetType: 'mikrotik_import', tenantId: null });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal error' });
+  }
+}
+
+/**
+ * HTTP syslog ingestion endpoint.
+ * Used when UDP syslog is not available (reverse proxy, Docker, etc.).
+ *
+ * Auth: Bearer token (ingest_token from mikrotik_credentials)
+ * Body: { lines: ["log line 1", "log line 2", ...] }
+ *   or: plain text (one log line per line)
+ *
+ * MikroTik config:
+ *   /tool/fetch url="https://obliguard.example.com/api/agent/mikrotik/ingest" \
+ *     http-method=post http-header-field="Authorization: Bearer <token>" \
+ *     http-data="<log lines>"
+ */
+export async function ingestMikroTikSyslog(req: Request, res: Response): Promise<void> {
+  // Extract token from Authorization header or query param
+  let token = '';
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    token = authHeader.slice(7);
+  } else if (typeof req.query.token === 'string') {
+    token = req.query.token;
+  }
+
+  if (!token) {
+    res.status(401).json({ error: 'Missing token (Authorization: Bearer <token> or ?token=<token>)' });
+    return;
+  }
+
+  // Lookup device by ingest token
+  const row = await db('mikrotik_credentials')
+    .join('agent_devices', 'agent_devices.id', 'mikrotik_credentials.device_id')
+    .where('mikrotik_credentials.ingest_token', token)
+    .where('agent_devices.status', 'approved')
+    .select('agent_devices.id as device_id', 'agent_devices.tenant_id')
+    .first() as { device_id: number; tenant_id: number } | undefined;
+
+  if (!row) {
+    res.status(403).json({ error: 'Invalid or unknown ingest token' });
+    return;
+  }
+
+  // Parse body — accept JSON { lines: [...] } or plain text
+  let lines: string[] = [];
+  if (req.is('application/json') && Array.isArray(req.body?.lines)) {
+    lines = req.body.lines;
+  } else if (typeof req.body === 'string') {
+    lines = req.body.split('\n').filter(Boolean);
+  } else if (typeof req.body?.data === 'string') {
+    lines = req.body.data.split('\n').filter(Boolean);
+  } else if (Buffer.isBuffer(req.body)) {
+    lines = req.body.toString('utf-8').split('\n').filter(Boolean);
+  }
+
+  if (lines.length === 0) {
+    res.json({ ok: true, processed: 0 });
+    return;
+  }
+
+  // Update syslog timestamp + mark online
+  db('mikrotik_credentials')
+    .where('device_id', row.device_id)
+    .update({ last_syslog_at: db.fn.now() })
+    .catch(() => {});
+  markMikrotikSeen(row.device_id);
+
+  // Parse and inject events
+  const events: AgentIpEvent[] = [];
+  for (const line of lines) {
+    const parsed = parseMikroTikSyslog(line.trim());
+    if (!parsed) continue;
+    events.push({
+      id: `${crypto.randomUUID()}-${Date.now()}`,
+      ip: parsed.ip,
+      username: parsed.username,
+      service: parsed.service,
+      eventType: parsed.eventType,
+      timestamp: new Date().toISOString(),
+      rawLog: parsed.rawLog,
+    });
+  }
+
+  if (events.length > 0) {
+    try {
+      await agentService.processEventsFlush(row.device_id, row.tenant_id, events);
+    } catch (err) {
+      logger.warn({ err, deviceId: row.device_id }, 'MikroTik HTTP ingest: event processing error');
+    }
+  }
+
+  res.json({ ok: true, processed: events.length });
+}

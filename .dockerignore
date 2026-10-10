@@ -1,0 +1,13 @@
+node_modules
+**/node_modules
+**/dist
+!agent/dist
+!obli.tools/dist
+!obli.tools/VERSION
+.git
+.env
+*.md
+# Hidden files and folders (local caches, editor and tool state): never part of a build context
+.*
+**/.*
+!agent/dist/.gitkeep

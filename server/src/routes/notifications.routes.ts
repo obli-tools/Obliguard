@@ -1,0 +1,42 @@
+import { Router } from 'express';
+import { notificationsController } from '../controllers/notifications.controller';
+import { requireAuth } from '../middleware/auth';
+import { requireCapability } from '../middleware/rbac';
+import { validate } from '../middleware/validate';
+import {
+  createChannelSchema,
+  updateChannelSchema,
+  channelTenantsSchema,
+  addBindingSchema,
+  removeBindingSchema,
+  listBindingsQuerySchema,
+  resolvedBindingsQuerySchema,
+} from '../validators/notification.schema';
+
+const router = Router();
+
+router.use(requireAuth);
+// Notification channels and bindings are tenant-owned (controller): delegated
+// through the tenant capability notifications.manage.
+router.use(requireCapability('notifications.manage'));
+
+// Plugin info
+router.get('/plugins', notificationsController.plugins);
+
+// Channels CRUD
+router.get('/channels', notificationsController.listChannels);
+router.get('/channels/:id', notificationsController.getChannel);
+router.post('/channels', validate(createChannelSchema), notificationsController.createChannel);
+router.put('/channels/:id', validate(updateChannelSchema), notificationsController.updateChannel);
+router.delete('/channels/:id', notificationsController.deleteChannel);
+router.post('/channels/:id/test', notificationsController.testChannel);
+router.get('/channels/:id/tenants', notificationsController.getChannelTenants);
+router.put('/channels/:id/tenants', validate(channelTenantsSchema), notificationsController.setChannelTenants);
+
+// Bindings
+router.get('/bindings/resolved', validate(resolvedBindingsQuerySchema, 'query'), notificationsController.resolvedBindings);
+router.get('/bindings', validate(listBindingsQuerySchema, 'query'), notificationsController.listBindings);
+router.post('/bindings', validate(addBindingSchema), notificationsController.addBinding);
+router.delete('/bindings', validate(removeBindingSchema), notificationsController.removeBinding);
+
+export default router;

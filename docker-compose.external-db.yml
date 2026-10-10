@@ -1,0 +1,56 @@
+# Use this compose file if you already have PostgreSQL running (e.g. on Unraid).
+# Usage: docker compose -f docker-compose.external-db.yml up -d
+#
+# Required .env variables:
+#   DATABASE_URL=postgres://obliguard:<password>@<host>:5432/obliguard
+#   SESSION_SECRET=<32+ random characters: openssl rand -hex 32>
+
+services:
+  server:
+    image: meejay/obliguard-server:${OBLIGUARD_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: ${DATABASE_URL}
+      # Required, 32+ random characters (openssl rand -hex 32): the server refuses
+      # to start in production with a missing, short or published value.
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set in .env (openssl rand -hex 32)}
+      # Optional dedicated key for stored credentials (MikroTik, M365); falls back to SESSION_SECRET.
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:-}
+      PREVIOUS_SESSION_SECRET: ${PREVIOUS_SESSION_SECRET:-}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost}
+      # Public URL of this instance (SSO redirect_uri, e-mail links) + extra hostnames allowed for SSO
+      APP_URL: ${APP_URL:-}
+      SSO_ALLOWED_HOSTS: ${SSO_ALLOWED_HOSTS:-}
+      BAN_MIN_PREFIX_V4: ${BAN_MIN_PREFIX_V4:-16}
+      BAN_MIN_PREFIX_V6: ${BAN_MIN_PREFIX_V6:-48}
+      BAN_PROTECTED_IPS: ${BAN_PROTECTED_IPS:-}
+      AGENT_MAX_PENDING_PER_KEY: ${AGENT_MAX_PENDING_PER_KEY:-500}
+      AGENT_KEY_BINDING: ${AGENT_KEY_BINDING:-strict}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      # Only used on a fresh database (install.sh generates one). Unset = admin123, logged as a warning.
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-}
+      # Client IP resolution behind proxies (see .env.example).
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-}
+      # External bans pushed by sibling apps (Oblihub) through Obligate delegation (see .env.example).
+      EXTERNAL_BAN_MAX_SECONDS: ${EXTERNAL_BAN_MAX_SECONDS:-}
+      OBLIGATE_ISSUER: ${OBLIGATE_ISSUER:-}
+      DELEGATION_ALLOW_JTI_REUSE: ${DELEGATION_ALLOW_JTI_REUSE:-}
+      # SSO membership reconciliation of Obligate accounts (see .env.example). Empty = on.
+      OBLIGATE_PRUNE_MEMBERSHIPS: ${OBLIGATE_PRUNE_MEMBERSHIPS:-}
+      NOTIFICATION_ALLOW_PRIVATE_TARGETS: ${NOTIFICATION_ALLOW_PRIVATE_TARGETS:-}
+    volumes:
+      # Persistent custom directory, kept for compatibility: the server (running
+      # as non-root) reads nothing from /custom any more (no SSH keys, no scripts).
+      - ${CUSTOM_DIR:-./custom}:/custom
+
+  client:
+    image: meejay/obliguard-client:${OBLIGUARD_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "${LISTEN_PORT:-3002}:80"
